@@ -3,9 +3,12 @@ import ast
 import configparser
 import os
 import time
+from turtle import heading
 
 import numpy as np
 import heapq
+
+from pyrsistent import ny
 import rclpy
 from rclpy.node import Node
 from rclpy.logging import set_logger_level, LoggingSeverity
@@ -188,63 +191,157 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
+
         if not self.path:
-            self.path = self.aStar(self.pose, self.goal_list[self.goal_index])
+            self.path = self.aStar(
+                        self.pose,
+                        self.goal_list[self.goal_index]
+        )
 
-        else: 
+        else:
+            # Current path cell
             grid_x, grid_y = self.path[self.path_index]
+
+            # Find the furthest cell in the same straight line
+            if self.path_index < len(self.path) - 1:
+
+                start_x, start_y = self.path[self.path_index]
+
+                next_x, next_y = self.path[self.path_index + 1]
+
+                # Current direction
+                dir_x = next_x - start_x
+                dir_y = next_y - start_y
+
+                target_index = self.path_index + 1
+
+                # Keep looking forward while path stays straight
+                while target_index < len(self.path) - 1:
+
+                    cx, cy = self.path[target_index]
+                    nx2, ny2 = self.path[target_index + 1]
+
+                    new_dir_x = nx2 - cx
+                    new_dir_y = ny2 - cy
+
+                    # Stop when A* changes direction
+                    if new_dir_x != dir_x or new_dir_y != dir_y:
+                        break
+
+                    target_index += 1
+
+                # Target the corner instead of every cell
+                grid_x, grid_y = self.path[target_index]
+
+            else:
+                target_index = self.path_index
             nx, ny = grid_to_world(grid_x, grid_y, self.origin, self.resolution)
-            
-            x, y, z = self.pose
-            pid_x = (nx - x) 
-            pid_y = (ny - y)
 
-            self.move_2D(self.kp * pid_x, self.kp * pid_y, 0)
-            
-            if np.hypot(pid_x, pid_y) < 0.1: ##Hypotenus < 0.1m, start moving to next cell
-                self.path_index += 1
+            x, y, heading = self.pose
 
+            dx = nx - x
+            dy = ny - y
+
+            # Direction of the next A* cell
+            target_heading = np.rad2deg(np.arctan2(dy, dx))
+
+            # Difference between where robot is facing
+            # and where the next cell is
+            heading_error = target_heading - heading
+
+            # Keep between -180 and 180 degrees
+            heading_error = (heading_error + 180) % 360 - 180
+
+            # =========================
+            # TURN FIRST
+            # =========================
+            if abs(heading_error) > 5:
+
+            # Fast turn when far away
+                if abs(heading_error) > 20:
+                    turn_speed = 4
+                else:
+                    turn_speed = 2
+
+                if heading_error > 0:
+                    self.move_2D(0, 0, turn_speed)
+                else:
+                    self.move_2D(0, 0, -turn_speed)
+
+            # =========================
+            # THEN MOVE FORWARD
+            # =========================
+            else:
+                distance = np.hypot(dx, dy)
+
+                self.move_2D(
+                    self.kp * distance,
+                    0,
+                    0
+                )
+
+            # Reached next A* cell
+                if distance < 0.1:
+                    self.path_index = target_index + 1
+
+
+            # =========================
+            # GOAL CHECK
+            # =========================
             gx, gy = self.goal_list[self.goal_index]
-            if np.hypot((gx-x), (gy-y)) < 0.1:
+
+            if np.hypot(gx - x, gy - y) < 0.1:
                 self.goal_index += 1
                 self.path_index = 0
                 self.path = []
 
-
-    ## A* algo
+        ###### INSERT CODE HERE ######
+    
     def aStar(self, start, goal_xy):
-        x, y = world_to_grid(start[0], start[1], self.origin, self.resolution)
-        goal = world_to_grid(goal_xy[0], goal_xy[1], self.origin, self.resolution)
+        x, y = world_to_grid(
+            start[0], start[1],
+            self.origin, self.resolution
+        )
+
+        goal = world_to_grid(
+            goal_xy[0], goal_xy[1],
+            self.origin, self.resolution
+        )
+
         plannedPath = []
 
         visited = [(x, y)]
         prevNode = {}
         queue = [(x, y)]
-        dir = [(1,0), (-1,0), (0,1), (0,-1)]
-        
 
-        while queue:       
+        directions = [(1,0), (-1,0), (0,1), (0,-1)]
+
+        while queue:
             cx, cy = queue.pop(0)
 
             if (cx, cy) == goal:
                 px, py = cx, cy
 
-                while (px, py) in prevNode: ##Backtracking to obtain path from robot location to goal
+                while (px, py) in prevNode:
                     plannedPath.insert(0, (px, py))
                     px, py = prevNode[(px, py)]
 
                 return plannedPath
-            else:
-                for dx, dy in dir:
-                    nx, ny = cx + dx, cy + dy
-                    if (nx, ny) not in visited and 0 <= nx <= 34 and 0 <= ny <=29 and self.map_array[nx, ny] == 0:
-                        visited.append((nx, ny))
-                        queue.append((nx, ny))
-                        prevNode[(nx, ny)] = (cx, cy)
 
+            for dx, dy in directions:
+                nx, ny = cx + dx, cy + dy
+
+                if (
+                    (nx, ny) not in visited
+                    and 0 <= nx <= 34
+                    and 0 <= ny <= 29
+                    and self.map_array[nx, ny] == 0
+                ):
+                    visited.append((nx, ny))
+                    queue.append((nx, ny))
+                    prevNode[(nx, ny)] = (cx, cy)
 
         return plannedPath
-        ###### INSERT CODE HERE ######
 
 
 class Grid():
