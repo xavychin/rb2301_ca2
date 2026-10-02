@@ -1,0 +1,13 @@
+{
+    "ROS2.distro": "jazzy",
+    "python.autoComplete.extraPaths": [
+        "/home/xavier/rb2301_ca2/build/rb2301_ca2",
+        "/home/xavier/rb2301_ca2/install/rb2301_ca2/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/xavier/rb2301_ca2/build/rb2301_ca2",
+        "/home/xavier/rb2301_ca2/install/rb2301_ca2/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
+}
