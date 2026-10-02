@@ -121,7 +121,7 @@ class WaypointNode(Node):
         self._last_printed_path = None
 
         ##Variables
-        self.kp = 3
+        self.kp = 5
         self.path_index = 0
         self.goal_index = 0
 
@@ -189,9 +189,20 @@ class WaypointNode(Node):
 
         ###### INSERT CODE HERE ######
         if not self.path:
-            self.path = self.aStar(self.pose, self.goal_list[self.goal_index])
+            if self.goal_index < len(self.goal_list):
+                self.path = self.aStar(self.pose, self.goal_list[self.goal_index])
+            else:
+                self.move_2D(0, 0, 0)
+                self.get_logger().info("All goals reached")
+                raise SystemExit
 
         else: 
+            if self.path_index >= len(self.path):
+                self.goal_index += 1
+                self.path_index = 0
+                self.path = []
+                return 
+
             grid_x, grid_y = self.path[self.path_index]
             nx, ny = grid_to_world(grid_x, grid_y, self.origin, self.resolution)
             
@@ -204,11 +215,8 @@ class WaypointNode(Node):
             if np.hypot(pid_x, pid_y) < 0.1: ##Hypotenus < 0.1m, start moving to next cell
                 self.path_index += 1
 
-            gx, gy = self.goal_list[self.goal_index]
-            if np.hypot((gx-x), (gy-y)) < 0.1:
-                self.goal_index += 1
-                self.path_index = 0
-                self.path = []
+            #gx, gy = self.goal_list[self.goal_index]
+
 
 
     ## A* algo
@@ -217,14 +225,29 @@ class WaypointNode(Node):
         goal = world_to_grid(goal_xy[0], goal_xy[1], self.origin, self.resolution)
         plannedPath = []
 
-        visited = [(x, y)]
+        def h(cell):
+            return np.hypot(cell[0] - goal[0], cell[1] - goal[1])
+
+        visited = []
         prevNode = {}
-        queue = [(x, y)]
+        queue = [(h((x, y)), (x, y))]
         dir = [(1,0), (-1,0), (0,1), (0,-1)]
+        surround = [(1,0), (-1,0), (0,1), (0,-1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+        g_cost = {(x, y): 0}
+
+        def step_cost(nx, ny):
+            for dx, dy in surround:
+                if 0 <= (nx + dx) <= 34 and 0 <= (ny + dy) <=29 and self.map_array[(nx + dx), (ny + dy)] != 0:
+                    return 3
+            return 1
         
 
         while queue:       
-            cx, cy = queue.pop(0)
+            _, (cx, cy) = heapq.heappop(queue)
+
+            if (cx, cy) in visited:
+                continue
+            visited.append((cx, cy))
 
             if (cx, cy) == goal:
                 px, py = cx, cy
@@ -237,10 +260,14 @@ class WaypointNode(Node):
             else:
                 for dx, dy in dir:
                     nx, ny = cx + dx, cy + dy
-                    if (nx, ny) not in visited and 0 <= nx <= 34 and 0 <= ny <=29 and self.map_array[nx, ny] == 0:
-                        visited.append((nx, ny))
-                        queue.append((nx, ny))
-                        prevNode[(nx, ny)] = (cx, cy)
+
+                    if 0 <= nx <= 34 and 0 <= ny <=29 and self.map_array[nx, ny] == 0:
+                        new_g = g_cost[(cx, cy)] + step_cost(nx, ny)
+
+                        if new_g < g_cost.get((nx, ny), float('inf')):
+                            g_cost[(nx, ny)] = new_g
+                            prevNode[(nx, ny)] = (cx, cy)
+                            heapq.heappush(queue, (new_g + h((nx, ny)), (nx, ny)))
 
 
         return plannedPath
