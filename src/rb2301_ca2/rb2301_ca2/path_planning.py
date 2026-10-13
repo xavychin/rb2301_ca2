@@ -176,6 +176,20 @@ class WaypointNode(Node):
         self.path = [] # Set this to your planned route (a list of grid-index tuples, in travel order) once you've computed it -- it'll automatically show up in the terminal map print
         self._last_printed_path = None
 
+        ##Variables
+        self.kp = 5
+        self.path_index = 0
+        self.goal_index = 0
+        self.rows, self.cols = self.map_array.shape
+
+        # PID (heading)
+        self.kp_turn = 1
+        self.ki_turn = 0.0
+        self.kd_turn = 0.02
+        self.heading_integral = 0.0
+        self.prev_heading_error = None
+        self.last_time = time.time()
+
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
         self._calibrate_ticks += 1
@@ -272,7 +286,264 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
-        self.move_2D(0.5)
+        # =========================
+        # PLANNING: no path -> plan one to the current goal
+        # =========================
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+
+        def reset_pid():
+            self.heading_integral = 0.0
+            self.prev_heading_error = None
+            
+        if not self.path:
+            if self.goal_index < len(self.goal_list):
+                # Run A* from the robot's current pose to the current goal
+                self.path = self.aStar(self.pose, self.goal_list[self.goal_index])
+
+                # A* returned [] -> no route to this goal.
+                # Stop and end the node instead of re-planning every tick,
+                # since goals must be visited in order.
+                if not self.path:
+                    self.get_logger().error(f"No path to goal {self.goal_index}")
+                    self.move_2D(0, 0, 0)
+                    raise SystemExit
+                reset_pid()  # Reset PID when a new path is planned
+            else:
+                # All goals visited: stop the robot and end the node
+                self.move_2D(0, 0, 0)
+                self.get_logger().info("All goals reached")
+                raise SystemExit
+
+        # =========================
+        # TRACKING: drive along the planned path
+        # =========================
+        else:
+            # Every cell on the path has been reached -> goal done.
+            # Fallback for when the goal check at the bottom has not fired yet.
+            # Advance to the next goal and clear the path so it re-plans next tick.
+            if self.path_index >= len(self.path):
+                self.goal_index += 1
+                self.path_index = 0
+                self.path = []
+                reset_pid()
+                return
+
+            # Default target: the next unreached cell on the path
+            grid_x, grid_y = self.path[self.path_index]
+
+            # -------------------------
+            # Corner skipping: A* returns every cell on the route, so instead of
+            # stopping at each one, aim for the last cell of the current straight
+            # (or 45-degree diagonal) run, i.e. the cell where the step changes.
+            # On a staircase (diagonal and straight steps alternating) each run is
+            # only one cell long, so the robot still targets cell by cell there.
+            # -------------------------
+            if self.path_index < len(self.path) - 1:
+
+                start_x, start_y = self.path[self.path_index]
+                next_x, next_y = self.path[self.path_index + 1]
+
+                # Grid step of the current run, e.g. (1, 0) = +x, (1, 1) = diagonal
+                dir_x = next_x - start_x
+                dir_y = next_y - start_y
+
+                target_index = self.path_index + 1
+
+                # Move target_index forward while the path keeps the same step
+                while target_index < len(self.path) - 1:
+
+                    cx, cy = self.path[target_index]
+                    nx2, ny2 = self.path[target_index + 1]
+
+                    new_dir_x = nx2 - cx
+                    new_dir_y = ny2 - cy
+
+                    # Step changes after this cell -> target_index is the corner
+                    if new_dir_x != dir_x or new_dir_y != dir_y:
+                        break
+
+                    target_index += 1
+
+                # Target the corner cell (or the last path cell if the run never turns)
+                grid_x, grid_y = self.path[target_index]
+
+            else:
+                # Only the last path cell is left: target it directly
+                target_index = self.path_index
+
+            # Target cell -> world coordinates of its centre (metres)
+            nx, ny = grid_to_world(grid_x, grid_y, self.origin, self.resolution)
+
+            # Robot pose: x, y in metres, heading in degrees
+            x, y, heading = self.pose
+
+            # Vector from the robot to the target
+            dx = nx - x
+            dy = ny - y
+
+            # Heading (degrees) that points the robot at the target
+            target_heading = np.rad2deg(np.arctan2(dy, dx))
+
+            # Angle the robot still has to turn
+            heading_error = target_heading - heading
+
+            # Wrap into [-180, 180) so the robot always turns the shorter way
+            heading_error = (heading_error + 180) % 360 - 180
+
+            # =========================
+            # TURN: rotate on the spot until within 5 degrees of the target heading
+            # =========================
+            if abs(heading_error) > 5:
+
+                if dt > 0:
+                    # I term, clamped so it can't wind up
+                    self.heading_integral += heading_error * dt
+                    self.heading_integral = float(np.clip(self.heading_integral, -20, 20))
+
+                    # D term (skipped on the first tick after a reset to avoid a spike)
+                    if self.prev_heading_error is None:
+                        derivative = 0.0
+                    else:
+                        derivative = (heading_error - self.prev_heading_error) / dt
+                    self.prev_heading_error = heading_error
+
+                    turn_speed = (self.kp_turn * heading_error
+                                  + self.ki_turn * self.heading_integral
+                                  + self.kd_turn * derivative)
+                else:
+                    turn_speed = self.kp_turn * heading_error
+
+                # Sign comes from the error, move_2D clips the magnitude
+                self.move_2D(0, 0, turn_speed)
+
+            # =========================
+            # DRIVE: move straight forward to the target (no sideways speed)
+            # =========================
+            else:
+                reset_pid()  # Reset PID when not turning
+                distance = np.hypot(dx, dy)
+
+                # Proportional control: speed scales with distance, so the robot
+                # slows as it arrives. move_2D clips it to the max speed.
+                speed = float(np.clip(self.kp * distance, 0, 0.4))
+                self.move_2D(
+                    speed,
+                    0,
+                    0
+                )
+
+                # Within 10 cm of the target cell -> it and every cell before it
+                # count as reached; the next target is searched from the cell after it
+                if distance < 0.1:
+                    self.path_index = target_index + 1
+
+            # =========================
+            # GOAL CHECK: within 10 cm of the actual goal point (world coordinates),
+            # which can be slightly off the centre of the goal cell
+            # =========================
+            gx, gy = self.goal_list[self.goal_index]
+
+            if np.hypot(gx - x, gy - y) < 0.1:
+                # Goal reached -> advance to the next goal and clear the path to re-plan
+                self.goal_index += 1
+                self.path_index = 0
+                self.path = []
+                reset_pid()  # Reset PID when a new path is planned
+
+    def aStar(self, start, goal_xy):
+        """A* search on the occupancy grid (8-connected).
+
+        start   -- robot pose [x, y, heading] in world coordinates
+        goal_xy -- goal (x, y) in world coordinates
+        Returns every grid cell from the start (start cell excluded) to the goal,
+        one cell apart, in travel order, or [] if no route exists.
+        """
+        # Start and goal: world (metres) -> grid cells
+        x, y = world_to_grid(
+            start[0], start[1],
+            self.origin, self.resolution
+        )
+
+        goal = world_to_grid(
+            goal_xy[0], goal_xy[1],
+            self.origin, self.resolution
+        )
+
+        plannedPath = []
+
+        def h(cell):  # Heuristic: octile distance from `cell` to `goal`
+            # Ignores walls, so it never overestimates the real cost
+            # (admissible) and stays consistent.
+            dx = abs(cell[0] - goal[0])
+            dy = abs(cell[1] - goal[1])
+            # min(dx, dy) diagonal steps (sqrt 2 each), then the rest straight (1 each)
+            return np.sqrt(2) * min(dx, dy) + (max(dx, dy) - min(dx, dy))
+
+        visited = set()        # Cells already expanded (closed set)
+        prevNode = {}          # cell -> the cell before it on its cheapest known route
+        # Min-heap of (f, h, cell), starting with the start cell (g = 0, so f = h).
+        # Python compares tuples element by element, so h breaks ties in f.
+        queue = [(h((x, y)), h((x, y)), (x, y))]
+        dir = [(1,0), (-1,0), (0,1), (0,-1), (1, 1), (1, -1), (-1, 1), (-1, -1)]  # 8-connected moves
+        g_cost = {(x, y): 0}   # cell -> cheapest known cost from the start (start = 0)
+
+        def step_cost(dx, dy):
+            """Cost of a single move (dx, dy): its length in cells."""
+            # sqrt 2 for a diagonal, 1 for a straight move (no wall penalty)
+            return np.sqrt(2) if (dx != 0 and dy != 0) else 1
+
+        while queue:
+            # Expand the cell with the lowest f = g + h.
+            # On a tie in f, the cell with the lower h (closer to the goal) comes first.
+            _, _, (cx, cy) = heapq.heappop(queue)
+
+            # A cell can be pushed more than once (each time a cheaper route is found).
+            # Its first pop is the cheapest, so skip later copies.
+            if (cx, cy) in visited:
+                continue
+            visited.add((cx, cy))
+
+            if (cx, cy) == goal:
+                # Goal reached: rebuild the route by following parents back to the start.
+                # Each parent is one cell back, so every cell on the route is included.
+                # The start cell has no parent, so it is left out of the path.
+                px, py = cx, cy
+
+                while (px, py) in prevNode:
+                    plannedPath.insert(0, (px, py))   # Prepend so the path runs start -> goal
+                    px, py = prevNode[(px, py)]
+
+                return plannedPath
+            else:
+                # Try each of the 8 neighbours of the current cell
+                for dx, dy in dir:
+                    nx, ny = cx + dx, cy + dy
+
+                    # Skip neighbours outside the grid or on a wall
+                    if not (0 <= nx < self.rows and 0 <= ny < self.cols) or self.map_array[nx, ny] != 0:
+                        continue
+
+                    # Skip diagonals that cut a corner: if either side cell next to
+                    # the diagonal is a wall, the robot would clip it
+                    if dx != 0 and dy != 0 and (self.map_array[cx + dx, cy] != 0 or self.map_array[cx, cy + dy] != 0):
+                        continue
+
+                    # Cost of reaching the neighbour by going through the current cell
+                    new_g = g_cost[(cx, cy)] + step_cost(dx, dy)
+
+                    # Keep it only if it beats the best route found so far
+                    # (unseen cells default to infinity, so their first route always wins)
+                    if new_g < g_cost.get((nx, ny), float('inf',)):
+                        g_cost[(nx, ny)] = new_g          # New best cost to the neighbour
+                        prevNode[(nx, ny)] = (cx, cy)     # Remember where it was reached from
+                        # Push (f, h, cell): f = cost so far + estimated cost remaining,
+                        # h = estimated cost remaining, used as the tie-breaker
+                        heapq.heappush(queue, (new_g + h((nx, ny)), h((nx, ny)), (nx, ny)))
+
+        # Queue empty without reaching the goal: no route exists
+        return plannedPath
         ###### INSERT CODE HERE ######
 
 
