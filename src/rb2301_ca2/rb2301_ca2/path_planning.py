@@ -177,72 +177,89 @@ class WaypointNode(Node):
         self._last_printed_path = None
 
         ##Variables
-        self.goal_index = 0
-        self.rows, self.cols = self.map_array.shape
-        self.segments = []      # Straight runs of self.path as ((start_x, start_y), (end_x, end_y)) in world metres
-        self.segment_index = 0  # Run currently being driven
-        self.turning = True     # True: rotate on the spot to face the run; False: drive along it
+        # ----- Route -----
+        # A goal's route is a list of straight runs (segments), each ((start_x, start_y), (end_x, end_y), heading to hold in rad).
+        # The robot turns on the spot to the run's heading, then drives it forwards (or backwards for some correction runs).
+        self.goal_index = 0                         # Index in goal_list of the goal being driven to
+        self.rows, self.cols = self.map_array.shape # Grid size, used for bounds checks
+        self.segments = []                          # Runs to the current goal; empty means "plan the next goal"
+        self.segment_index = 0                      # Run being driven
+        self.turning = True                         # True: turning on the spot to face the run, False: driving along it
 
-        # Controller settings, the same for simulation and the real robot.
-        # Everything is in SI units: metres, radians, seconds.
-        # Heading PID: heading error (rad) -> turn rate wanted (rad/s)
+        # ----- Robot base (robot frame: x forward, y left, metres) -----
+        # The goal has to end up under the base, so the base centre is what is driven along the runs and put on each goal.
+        # The pose is the Optitrack rigid body's pivot, which can be anywhere on the robot. The robot turns on the spot about
+        # its base centre, so the pivot -> base centre offset is measured from those turns (measure_base_offset()).
+        self.base_offset = (0.0, 0.0)               # Pivot -> base centre, starts at 0 until the first turn is measured
+        self.base_half_size = (0.106, 0.079)        # Half length and half width of the base around its centre
+        self.footprint_margin = 0.02                # m, a goal counts as under the base only this far inside its edge
+
+        # ----- Base offset measurement -----
+        self.turn_samples = []                      # Pivot (x, y, heading in rad) during the current turn on the spot
+        self.offset_fit_sum = np.zeros(2)           # Sum of measured offsets, each weighted by how far that turn went
+        self.offset_fit_weight = 0.0                # Sum of the weights, base_offset = sum / weight
+        self.min_fit_turn = np.deg2rad(40)          # Shorter turns are not used, the fit is unreliable
+        self.max_fit_residual = 0.01                # m, fits worse than this are ignored (wheel slip, tracking glitch)
+        self.max_base_offset = 0.2                  # m, larger offsets can't be on the robot and are ignored
+
+        # ----- A* costs (in cells, a step costs 1) -----
+        self.turn_penalty = 2.0                     # Extra cost per 90-degree turn, prefers fewer corners
+        self.wall_penalty = 2.0                     # Extra cost for a cell next to a wall, keeps the route in the middle of corridors
+        self.wall_penalty_range = 2                 # Cells, the wall penalty fades to 0 over this distance
+        self.wall_cost = self.build_wall_cost()     # Wall penalty of every cell, worked out once
+
+        # ----- Heading PID: heading error (rad) -> turn rate (rad/s) -----
         self.kp_turn = 4.0
         self.ki_turn = 1.0
-        self.kd_turn = 0.1
-        self.max_turn_speed = 1.6           # rad/s of actual turning (move_2D also caps the command at 2x max_translate_velocity)
-        self.min_turn_speed = 0.2           # rad/s, smallest turn rate asked for while turning on the spot
-        self.heading_integral_limit = 0.5   # rad*s, anti wind-up clamp on the I term
+        self.kd_turn = 0.1                          # Acts on the measured turn rate, damps overshoot
+        self.max_turn_speed = 0.8                   # rad/s
+        self.min_turn_speed = 0.2                   # rad/s, floor while turning on the spot so the turn finishes
+        self.heading_integral_limit = 0.5           # rad*s, anti wind-up
 
-        # Speed P controller: distance left along the run (m) -> forward speed (m/s)
-        self.kp_drive = 2.0
-        self.min_drive_speed = 0.05         # m/s, so the robot never stalls just short of a corner
-        self.max_accel = 1.0                # m/s^2, ramps the speed up instead of jumping to full speed
+        # ----- Driving speed: P on the distance left in the run -----
+        self.kp_drive = 2.0                         # (m/s) per metre left
+        self.min_drive_speed = 0.05                 # m/s, floor so the robot doesn't creep at the end of a run
+        self.max_accel = 1.0                        # m/s^2, ramps the speed up after each turn
 
-        # Cross-track correction: while driving, angle slightly back onto the run's centre line.
-        # On-the-spot turns always go to the exact grid heading (0, 90, 180 or -90 degrees); only while
-        # driving is the heading bent a little, and the bend fades out over the last part of the run so
-        # the robot arrives at the corner square to the maze.
-        self.k_cross_track = 4.0            # rad of heading correction per metre off the line
+        # ----- Cross-track correction: steer back onto the run's centre line -----
+        self.k_cross_track = 4.0                    # rad of heading change per metre off the line
         self.max_cross_track_correction = np.deg2rad(8)
-        self.cross_track_fade_distance = 0.2  # m, the correction fades to 0 over this last stretch of the run
+        self.cross_track_fade_distance = 0.2        # m, fades out over this distance before a corner
 
-        # Deadband compensation, learned while the robot runs.
-        # Friction eats the first part of every command: below it the robot doesn't move at all. In Gazebo
-        # that is ~1.2 rad/s of an on-the-spot turn and ~0.13 m/s of driving; the real robot has its own amount.
-        # The offsets below are added on top of each command. They start at 0 and are learned from the
-        # measured motion: raised while the robot is (nearly) stalled, i.e. moving at under stall_ratio of the
-        # speed asked for, and lowered slowly while it moves clearly faster than asked. (A loose "nearly stalled"
-        # test is used instead of matching speeds exactly because Gazebo can run slower than real time,
-        # which makes every measured speed look too slow.)
-        # While driving forward the turn command is followed exactly, so the turn offset is only used for on-the-spot turns.
-        self.turn_deadband = 0.0            # rad/s, learned
-        self.drive_deadband = 0.0           # m/s, learned
-        self.turn_deadband_rise = 1.5       # rad/s per second, how fast the turn offset rises while stalled
-        self.drive_deadband_rise = 0.15     # m/s per second, same for driving
-        self.deadband_fall = 0.3            # Fraction per second the offsets drop while the robot moves clearly too fast
-        self.stall_ratio = 0.3              # Moving at under this fraction of the speed asked for counts as stalled
-        self.stall_turn_rate = 0.05         # rad/s, measured turn rate below this always counts as stalled
-        self.stall_speed = 0.02             # m/s, measured speed below this always counts as stalled
-        self.max_turn_deadband = 2.0        # rad/s
-        self.max_drive_deadband = 0.3       # m/s
-        self.learn_delay = 0.3              # s, don't learn just after starting a turn / run while the robot is still speeding up
+        # ----- Deadband compensation: offsets added to commands, learned while driving, to overcome friction -----
+        self.turn_deadband = 0.0                    # rad/s, current learned value
+        self.drive_deadband = 0.0                   # m/s, current learned value
+        self.turn_deadband_rise = 1.5               # rad/s per s, growth while stalled
+        self.drive_deadband_rise = 0.15             # m/s per s, growth while stalled
+        self.deadband_fall = 0.3                    # Fraction lost per s while clearly moving too fast
+        self.stall_ratio = 0.3                      # Moving at under this fraction of the speed asked for = stalled
+        self.stall_turn_rate = 0.05                 # rad/s, turning slower than this = stalled
+        self.stall_speed = 0.02                     # m/s, driving slower than this = stalled
+        self.max_turn_deadband = 2.0                # rad/s
+        self.max_drive_deadband = 0.3               # m/s
+        self.learn_delay = 0.3                      # s after a turn or drive starts before learning (and turn sampling) begins
 
-        # Tolerances
-        self.align_tolerance = np.deg2rad(3)      # On-the-spot turn is done once within this of the run's heading
-        self.realign_threshold = np.deg2rad(25)   # While driving, stop and turn on the spot again past this error
-        self.turn_timeout = 5.0                   # s, after this an on-the-spot turn is accepted within the looser tolerance below
-        self.turn_timeout_tolerance = np.deg2rad(10)  # (the heading PID keeps correcting while driving)
-        self.position_tolerance = 0.02            # m, run is done once the robot is this close to (or past) its end
+        # ----- Tolerances -----
+        self.align_tolerance = np.deg2rad(3)        # Turn on the spot is done within this
+        self.realign_threshold = np.deg2rad(25)     # Heading error while driving that triggers a new turn on the spot
+        self.turn_timeout = 5.0                     # s, after this a turn is accepted within turn_timeout_tolerance
+        self.turn_timeout_tolerance = np.deg2rad(10)
+        self.position_tolerance = 0.02              # m left in a run that counts as the end of it
+        self.goal_tolerance = 0.03                  # m, base centre this close to the goal = reached
+        self.straight_correction_tolerance = 0.01   # m, sideways miss small enough to fix by driving straight, no turn
+        self.max_goal_corrections = 5               # After this many correction runs, accept the goal if it is under the base
+        self.give_up_corrections = 10               # After this many, move on to the next goal anyway
 
-        # Controller memory
-        self.heading_integral = 0.0
-        self.prev_pose = None          # Pose on the previous tick, to measure the robot's actual motion
-        self.measured_turn_rate = 0.0  # rad/s, filtered
-        self.measured_speed = 0.0      # m/s forward, filtered
-        self.speed = 0.0               # Last forward speed asked for, for the acceleration limit
-        self.last_time = None
-        self.turn_start_time = time.time()
-        self.drive_start_time = time.time()
+        # ----- Controller state -----
+        self.goal_corrections = 0                   # Correction runs done for the current goal
+        self.heading_integral = 0.0                 # Heading PID integral
+        self.prev_pose = None                       # Pivot (x, y, heading in rad) at the last tick, for the measured rates
+        self.measured_turn_rate = 0.0               # rad/s, filtered
+        self.measured_speed = 0.0                   # m/s forwards, filtered
+        self.speed = 0.0                            # m/s, last driving speed asked for (before the deadband)
+        self.last_time = None                       # Time of the last tick, for dt
+        self.turn_start_time = time.time()          # When the current turn on the spot started
+        self.drive_start_time = time.time()         # When the current drive started
 
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
@@ -340,282 +357,317 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
-        # Time since the last tick (`now` is set at the top of this callback), clamped so a stall or the very first tick can't blow up the I/D terms
+        # Each tick does one of three things: PLAN the route to the next goal, TURN on the spot to face the current run,
+        # or DRIVE along it. When the last run of a goal ends, finish_goal() checks the base is on the goal and adds
+        # correction runs if it isn't.
+
+        # Time since the last tick, clipped so a hiccup can't blow up the PID terms
         dt = 0.05 if self.last_time is None else float(np.clip(now - self.last_time, 1e-3, 0.2))
         self.last_time = now
 
         x, y, heading_deg = self.pose
         heading = np.deg2rad(heading_deg)
 
-        # Measure the robot's actual turn rate and forward speed from the change in pose since the last tick
-        # (low-pass filtered to smooth out pose noise). Used for the D term and for learning the deadbands.
+        # Measured turn rate and forward speed from the pose change, low-pass filtered (used by the PID D term and deadband learning)
         if self.prev_pose is not None:
-            px, py, ph = self.prev_pose
-            rate_now = math.remainder(heading - ph, 2 * math.pi) / dt  # remainder wraps the angle into [-pi, pi]
-            speed_now = ((x - px) * math.cos(heading) + (y - py) * math.sin(heading)) / dt
+            last_x, last_y, last_heading = self.prev_pose
+            rate_now = math.remainder(heading - last_heading, 2 * math.pi) / dt
+            speed_now = ((x - last_x) * math.cos(heading) + (y - last_y) * math.sin(heading)) / dt
             self.measured_turn_rate += 0.5 * (rate_now - self.measured_turn_rate)
             self.measured_speed += 0.5 * (speed_now - self.measured_speed)
         self.prev_pose = (x, y, heading)
+        bx, by = self.base_centre()  # The point that is driven along the runs
 
-        # =========================
-        # PLANNING: no runs left -> plan a path to the current goal
-        # =========================
+        # ===== PLAN: no runs left -> plan to the next goal =====
         if not self.segments:
             if self.goal_index >= len(self.goal_list):
-                # All goals visited: stop the robot and end the node
                 self.move_2D(0, 0, 0)
                 self.get_logger().info("All goals reached")
                 raise SystemExit
 
             goal_xy = self.goal_list[self.goal_index]
-            start_cell = world_to_grid(x, y, self.origin, self.resolution)
             goal_cell = world_to_grid(goal_xy[0], goal_xy[1], self.origin, self.resolution)
-
-            if start_cell == goal_cell:
-                # Already in the goal cell: A* has nothing to do, just drive to the goal point
-                self.path = []
-                points = [(x, y), tuple(goal_xy)]
-            else:
-                self.path = self.aStar(self.pose, goal_xy)
-                # A* returned [] -> no route to this goal.
-                # Stop and end the node instead of re-planning every tick,
-                # since goals must be visited in order.
-                if not self.path:
-                    self.get_logger().error(f"No path to goal {self.goal_index}")
-                    self.move_2D(0, 0, 0)
-                    raise SystemExit
-                # Path pruning: keep only the nodes where the direction changes (plus the start and the end)
-                pruned = self.prune_path([start_cell] + self.path)
-                self.get_logger().info(f"Path to goal {self.goal_index}: {len(self.path)} cells, pruned to {len(pruned)} nodes: {pruned}")
-                # Pruned nodes -> world points (cell centres), finishing on the exact goal point (inside the last cell)
-                points = [grid_to_world(i, j, self.origin, self.resolution) for i, j in pruned]
-                points[-1] = tuple(goal_xy)
-
-            # Consecutive corner points form the straight runs to drive (zero-length ones dropped)
-            self.segments = [(a, b) for a, b in zip(points, points[1:]) if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-6]
             self.segment_index = 0
+            # Already in the goal cell: no route needed, the correction runs in finish_goal() place the base
+            if world_to_grid(bx, by, self.origin, self.resolution) == goal_cell:
+                self.finish_goal()
+                return
+
+            path = self.aStar((bx, by, heading_deg), goal_xy)
+            if not path:
+                self.get_logger().error(f"No path to goal {self.goal_index}")
+                self.move_2D(0, 0, 0)
+                raise SystemExit
+
+            self.path = self.prune_path(path)  # Only the corners are needed, they become the ends of the runs
+            self.get_logger().info(f"Path to goal {self.goal_index}: {len(path)} cells, pruned to {len(self.path)} nodes: {self.path}")
+            # Corner cells -> world points, ending on the exact goal point
+            points = [grid_to_world(i, j, self.origin, self.resolution) for i, j in self.path]
+            points[-1] = tuple(goal_xy)
+            # Each run is driven forwards, so its heading is its direction
+            self.segments = [(a, b, math.atan2(b[1] - a[1], b[0] - a[0])) for a, b in zip(points, points[1:])]
             self.start_turn()
-            if not self.segments:
-                self.goal_done()
             return
 
-        # =========================
-        # TRACKING: drive along the current straight run
-        # =========================
-        (sx, sy), (ex, ey) = self.segments[self.segment_index]
-        length = math.hypot(ex - sx, ey - sy)
-        ux, uy = (ex - sx) / length, (ey - sy) / length  # Unit vector along the run
+        # ===== Where the robot is relative to the current run =====
+        (sx, sy), (ex, ey), run_heading = self.segments[self.segment_index]
+        hx, hy = math.cos(run_heading), math.sin(run_heading)
+        direction = 1.0 if (ex - sx) * hx + (ey - sy) * hy >= 0 else -1.0  # +1 forwards, -1 in reverse
+        ux, uy = direction * hx, direction * hy     # Direction of travel
+        along = (ex - bx) * ux + (ey - by) * uy     # Distance left along the run
+        cross = ux * (by - sy) - uy * (bx - sx)     # Distance off the line (+ = left)
+        turn_error = math.remainder(run_heading - heading, 2 * math.pi)
 
-        # Distance still to go to the end of the run, measured along it (negative once past the end)
-        along = (ex - x) * ux + (ey - y) * uy
-        # Signed distance from the run's centre line (positive = robot is left of the line)
-        cross = ux * (y - sy) - uy * (x - sx)
+        # ===== TURN on the spot to face the run =====
+        if not self.turning and abs(turn_error) > self.realign_threshold:
+            self.start_turn()  # Knocked off course while driving
 
-        # Run finished -> stop, then turn on the spot to face the next run
+        if self.turning:
+            timed_out = now - self.turn_start_time > self.turn_timeout
+            if abs(turn_error) < self.align_tolerance or (timed_out and abs(turn_error) < self.turn_timeout_tolerance):
+                # Facing the run: switch to driving, and use this turn to measure the base offset
+                self.turning = False
+                self.heading_integral = 0.0
+                self.drive_start_time = now
+                self.measure_base_offset()
+            else:
+                # Turn at the PID rate, at least min_turn_speed, plus the learned deadband
+                turn_rate = max(abs(self.heading_pid(turn_error, dt)), self.min_turn_speed)
+                turn_rate = min(turn_rate, 2 * max_translate_velocity - self.turn_deadband)  # Stay under move_2D's cap
+                if now - self.turn_start_time > self.learn_delay:  # Skips the start, while the robot may still be rolling
+                    self.turn_samples.append((x, y, heading))
+                    measured = math.copysign(1, turn_error) * self.measured_turn_rate
+                    self.turn_deadband = self.learn_deadband(self.turn_deadband, turn_rate, measured, self.stall_turn_rate,
+                                                             self.turn_deadband_rise, self.max_turn_deadband, dt)
+                self.move_2D(0, 0, math.copysign(turn_rate + self.turn_deadband, turn_error))
+                return
+
+        # ===== End of the run: next run, or check the goal =====
         if along < self.position_tolerance:
             self.segment_index += 1
             if self.segment_index >= len(self.segments):
-                self.goal_done()  # Last run -> goal reached (goal_done stops the robot)
+                self.finish_goal()
             else:
                 self.move_2D(0, 0, 0)
                 self.start_turn()
             return
 
-        # The run's direction: exactly along a grid axis (0, 90, 180 or -90 degrees).
-        # On-the-spot turns aim for exactly this, so every turn is a clean 90 (or 180) degrees.
-        run_heading = math.atan2(uy, ux)
-        turn_error = math.remainder(run_heading - heading, 2 * math.pi)
-
-        # While driving: the run's direction, bent slightly towards the centre line if the robot has drifted
-        # off it. The bend is capped at a few degrees and fades out near the end of the run.
-        fade = min(1.0, along / self.cross_track_fade_distance)
+        # ===== DRIVE along the run =====
+        # Steer back onto the line. Fades out before corners (the next turn fixes it), stays on for the last run
+        last_run = self.segment_index == len(self.segments) - 1
+        fade = 1.0 if last_run else float(np.clip(along / self.cross_track_fade_distance, 0.0, 1.0))
         correction = fade * float(np.clip(-self.k_cross_track * cross, -self.max_cross_track_correction, self.max_cross_track_correction))
         drive_error = math.remainder(run_heading + correction - heading, 2 * math.pi)
 
-        # =========================
-        # TURN: rotate on the spot until facing the run
-        # =========================
-        if not self.turning and abs(turn_error) > self.realign_threshold:
-            self.start_turn()  # Knocked badly off course while driving -> stop and re-align
-
-        if self.turning:
-            # Done once within tolerance, or within the looser tolerance if the turn is taking too long
-            timed_out = now - self.turn_start_time > self.turn_timeout
-            if abs(turn_error) < self.align_tolerance or (timed_out and abs(turn_error) < self.turn_timeout_tolerance):
-                self.turning = False
-                self.heading_integral = 0.0  # Fresh I term for the drive
-                self.drive_start_time = now
-            else:
-                turn_rate = self.heading_pid(turn_error, dt)
-                # Never ask for less than the minimum, or the robot can stall a few degrees short
-                turn_rate = max(abs(turn_rate), self.min_turn_speed)
-                # Don't ask for more than move_2D lets through once the deadband is added
-                turn_rate = min(turn_rate, 2 * max_translate_velocity - self.turn_deadband)
-
-                # Learn the turn deadband from the measured turn rate (in the direction asked for)
-                if now - self.turn_start_time > self.learn_delay:
-                    measured = math.copysign(1, turn_error) * self.measured_turn_rate
-                    self.turn_deadband = self.learn_deadband(self.turn_deadband, turn_rate, measured, self.stall_turn_rate,
-                                                             self.turn_deadband_rise, self.max_turn_deadband, dt)
-
-                # Add the deadband on top so the robot really turns at turn_rate
-                self.move_2D(0, 0, math.copysign(turn_rate + self.turn_deadband, turn_error))
-                return
-
-        # =========================
-        # DRIVE: forward speed from the distance left, steering from the heading PID
-        # =========================
-        # P on distance so it slows into the corner, at least min speed so it actually arrives
         target_speed = float(np.clip(self.kp_drive * along, self.min_drive_speed, max_translate_velocity))
-        # Ease off while the heading is still being corrected
-        target_speed *= math.cos(drive_error)
-        # Acceleration limit on the way up (slowing down is already gradual from the P term)
-        self.speed = min(target_speed, self.speed + self.max_accel * dt)
-
-        # Learn the drive deadband from the measured forward speed
+        target_speed *= math.cos(drive_error)                               # Slow down while off heading
+        self.speed = min(target_speed, self.speed + self.max_accel * dt)    # Acceleration limit
         if now - self.drive_start_time > self.learn_delay:
-            self.drive_deadband = self.learn_deadband(self.drive_deadband, self.speed, self.measured_speed, self.stall_speed,
+            self.drive_deadband = self.learn_deadband(self.drive_deadband, self.speed, direction * self.measured_speed, self.stall_speed,
                                                       self.drive_deadband_rise, self.max_drive_deadband, dt)
-
-        turn_speed = self.heading_pid(drive_error, dt)
-        # Add the drive deadband on top so the robot really moves at self.speed
-        self.move_2D(self.speed + self.drive_deadband, 0, turn_speed)
+        self.move_2D(direction * (self.speed + self.drive_deadband), 0, self.heading_pid(drive_error, dt))
 
     def heading_pid(self, error:float, dt:float) -> float:
-        '''PID on the heading error (rad) -> angular velocity (rad/s).
-        The D term uses the measured turn rate instead of the change in error, so a jump
-        in the desired heading (new run) does not cause a derivative kick.'''
-        # Only integrate close to the target (no wind-up during big turns), and clamp it
-        if abs(error) < np.deg2rad(15):
+        '''Heading error (rad) -> turn rate (rad/s). The D term uses the measured turn rate.'''
+        if abs(error) < np.deg2rad(15):  # Integrate only near the target, so big turns don't wind it up
             self.heading_integral = float(np.clip(self.heading_integral + error * dt,
                                                   -self.heading_integral_limit, self.heading_integral_limit))
-
         turn_speed = self.kp_turn * error + self.ki_turn * self.heading_integral - self.kd_turn * self.measured_turn_rate
         return float(np.clip(turn_speed, -self.max_turn_speed, self.max_turn_speed))
 
     def learn_deadband(self, deadband:float, asked:float, measured:float, stall_floor:float,
                        rise:float, limit:float, dt:float) -> float:
-        '''One learning step for a deadband offset (turning or driving); returns the updated offset.
-        Stalled (moving at under stall_ratio of the speed asked for, or under stall_floor) -> raise it at `rise`
-        per second. Clearly faster than asked -> lower it slowly. Clamped to [0, limit].'''
+        '''Raise the offset while stalled, lower it while clearly too fast.'''
         if measured < max(stall_floor, self.stall_ratio * asked):
-            deadband += rise * dt                               # Stalled: push harder
+            deadband += rise * dt
         elif measured > 1.5 * asked + 2 * stall_floor:
-            deadband -= self.deadband_fall * deadband * dt      # Clearly too fast: ease off
+            deadband -= self.deadband_fall * deadband * dt
         return float(np.clip(deadband, 0.0, limit))
 
     def start_turn(self):
-        '''Switch to turning on the spot, with the speed and I term reset.'''
+        '''Switch to turning on the spot (speed and PID integral start again from zero).'''
         self.turning = True
         self.speed = 0.0
         self.heading_integral = 0.0
         self.turn_start_time = time.time()
+        self.turn_samples = []
+
+    def base_centre(self) -> tuple:
+        '''World (x, y) of the centre of the robot's base: the Optitrack pivot moved by base_offset.'''
+        x, y, heading_deg = self.pose
+        h = math.radians(heading_deg)
+        ox, oy = self.base_offset
+        return (x + ox * math.cos(h) - oy * math.sin(h), y + ox * math.sin(h) + oy * math.cos(h))
+
+    def goal_in_base_frame(self, gx:float, gy:float) -> tuple:
+        '''Goal relative to the base centre: (ahead, left) in metres.'''
+        bx, by = self.base_centre()
+        h = math.radians(self.pose[2])
+        dx, dy = gx - bx, gy - by
+        return (dx * math.cos(h) + dy * math.sin(h), -dx * math.sin(h) + dy * math.cos(h))
+
+    def measure_base_offset(self):
+        '''After a turn on the spot, fit the point the robot turned about (its base centre) and update base_offset.
+        Every pivot sample satisfies p = c + R(heading) d, with c the fixed base centre and d the pivot's offset
+        from it in the robot frame, which is linear in (c, d), so least squares solves it.'''
+        samples, self.turn_samples = self.turn_samples, []
+        if len(samples) < 10:
+            return
+        xs, ys, hs = np.array(samples).T
+        hs = np.unwrap(hs)  # No jump at +-180 degrees
+        span = float(hs.max() - hs.min())
+        if span < self.min_fit_turn:
+            return
+        # Unknowns [cx, cy, dx, dy]; rows: x = cx + cos*dx - sin*dy and y = cy + sin*dx + cos*dy
+        n = len(xs)
+        A = np.zeros((2 * n, 4))
+        A[:n, 0], A[:n, 2], A[:n, 3] = 1.0, np.cos(hs), -np.sin(hs)
+        A[n:, 1], A[n:, 2], A[n:, 3] = 1.0, np.sin(hs), np.cos(hs)
+        b = np.concatenate((xs, ys))
+        solution = np.linalg.lstsq(A, b, rcond=None)[0]
+        residual = float(np.sqrt(np.mean((A @ solution - b) ** 2)))
+        offset = -solution[2:]  # Pivot -> base centre
+        if residual > self.max_fit_residual or np.hypot(*offset) > self.max_base_offset:
+            self.get_logger().debug(f"Base offset fit ignored: offset {offset}, residual {residual:.4f} m")
+            return
+        # Running average over all turns, longer turns count more
+        self.offset_fit_sum += span * offset
+        self.offset_fit_weight += span
+        self.base_offset = tuple(float(v) for v in self.offset_fit_sum / self.offset_fit_weight)
+        self.get_logger().info(f"Base centre is {self.base_offset[0]:+.3f} m ahead, {self.base_offset[1]:+.3f} m left "
+                               f"of the Optitrack pivot (this turn: {offset[0]:+.3f}, {offset[1]:+.3f}, residual {residual:.4f} m)")
+
+    def finish_goal(self):
+        '''Goal done once the base centre is within goal_tolerance (or, after max_goal_corrections, once the goal is
+        under the base). Otherwise add a correction run that puts the base centre on the goal.'''
+        gx, gy = self.goal_list[self.goal_index]
+        ahead, left = self.goal_in_base_frame(gx, gy)
+        miss = math.hypot(ahead, left)
+        under_base = (abs(ahead) <= self.base_half_size[0] - self.footprint_margin and
+                      abs(left) <= self.base_half_size[1] - self.footprint_margin)
+        if miss <= self.goal_tolerance:
+            self.goal_done()
+            return
+        if self.goal_corrections >= self.max_goal_corrections and under_base:
+            self.get_logger().info(f"Goal {self.goal_index} is {miss:.3f} m from the base centre but under the base, accepting")
+            self.goal_done()
+            return
+        if self.goal_corrections >= self.give_up_corrections:
+            self.get_logger().warn(f"Goal {self.goal_index} still {miss:.3f} m off after {self.goal_corrections} corrections, moving on")
+            self.goal_done()
+            return
+        self.goal_corrections += 1
+        self.get_logger().info(f"Goal {self.goal_index} is {miss:.3f} m away ({ahead:+.3f} ahead, {left:+.3f} left), "
+                               f"correction run {self.goal_corrections}")
+        self.move_2D(0, 0, 0)
+
+        # The correction run is appended; segment_index already points past the last run, so it is driven next
+        bx, by = self.base_centre()
+        heading = math.radians(self.pose[2])
+        if abs(left) <= self.straight_correction_tolerance:
+            # Nearly in line: drive straight forwards or backwards, no turn
+            end = (bx + ahead * math.cos(heading), by + ahead * math.sin(heading))
+            self.segments.append(((bx, by), end, heading))
+        else:
+            # Face the goal, or face away and reverse onto it, whichever turn is smaller
+            to_goal = math.atan2(gy - by, gx - bx)
+            new_heading = min((to_goal, to_goal + math.pi), key=lambda h: abs(math.remainder(h - heading, 2 * math.pi)))
+            self.segments.append(((bx, by), (gx, gy), new_heading))
+        self.start_turn()
 
     def goal_done(self):
-        '''Current goal reached: stop and move on to the next one (it gets planned on the next tick).'''
+        '''Stop and move on to the next goal (empty segments make the next tick plan it).'''
         self.move_2D(0, 0, 0)
         self.get_logger().info(f"Reached goal {self.goal_index}: {self.goal_list[self.goal_index]}")
+        self.goal_corrections = 0
         self.goal_index += 1
         self.segments = []
         self.path = []
 
+    def build_wall_cost(self) -> np.ndarray:
+        '''Per-cell A* cost for being near a wall: wall_penalty next to a wall, fading to 0 wall_penalty_range cells away.'''
+        # Breadth-first search outwards from every wall cell (8-connected) gives each free cell its distance to the nearest wall
+        dist = np.where(self.map_array != 0, 0.0, np.inf)  # Distance to the nearest wall, in cells
+        frontier = [tuple(c) for c in np.argwhere(self.map_array != 0)]
+        d = 0
+        while frontier and d < self.wall_penalty_range:
+            d += 1
+            next_frontier = []
+            for cx, cy in frontier:
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < self.rows and 0 <= ny < self.cols and dist[nx, ny] == np.inf:
+                            dist[nx, ny] = d
+                            next_frontier.append((nx, ny))
+            frontier = next_frontier
+        # Distance 1 -> full penalty, wall_penalty_range + 1 or more -> none
+        scale = np.clip((self.wall_penalty_range + 1 - dist) / self.wall_penalty_range, 0.0, 1.0)
+        return self.wall_penalty * scale
+
     def prune_path(self, cells:list) -> list:
-        '''Path pruning: drop every node where the direction does not change.
-        cells is the full route (start cell first), one cell apart. A node is kept only if the step into it
-        differs from the step out of it, i.e. the robot has to turn there. The first and last nodes are
-        always kept. The robot then drives straight from each kept node to the next.'''
+        '''Keep only the start, the end and the cells where the direction changes.'''
         pruned = [cells[0]]
         for prev, cell, nxt in zip(cells, cells[1:], cells[2:]):
-            step_in = (cell[0] - prev[0], cell[1] - prev[1])
-            step_out = (nxt[0] - cell[0], nxt[1] - cell[1])
-            if step_in != step_out:   # Direction changes here -> keep the node
+            if (cell[0] - prev[0], cell[1] - prev[1]) != (nxt[0] - cell[0], nxt[1] - cell[1]):
                 pruned.append(cell)
-            # Same direction -> prune it
-        if len(cells) > 1:
-            pruned.append(cells[-1])
-        return pruned
+        return pruned + [cells[-1]]
 
     def aStar(self, start, goal_xy):
-        """A* search on the occupancy grid (4-connected).
+        '''A* on the grid (4-connected) with turn and wall costs. start is (x, y, heading in degrees).
+        Returns the cells from start to goal (both included), or [] if there is no route.'''
+        start_cell = world_to_grid(start[0], start[1], self.origin, self.resolution)
+        goal = world_to_grid(goal_xy[0], goal_xy[1], self.origin, self.resolution)
 
-        start   -- robot pose [x, y, heading] in world coordinates
-        goal_xy -- goal (x, y) in world coordinates
-        Returns every grid cell from the start (start cell excluded) to the goal,
-        one cell apart, in travel order, or [] if no route exists.
-        """
-        # Start and goal: world (metres) -> grid cells
-        x, y = world_to_grid(
-            start[0], start[1],
-            self.origin, self.resolution
-        )
-
-        goal = world_to_grid(
-            goal_xy[0], goal_xy[1],
-            self.origin, self.resolution
-        )
-
-        plannedPath = []
-
-        def h(cell):  # Heuristic: Manhattan distance from `cell` to `goal`
-            # Ignores walls, so it never overestimates the real cost
-            # (admissible) and stays consistent.
-            # With only 4-connected moves, dx + dy straight steps (1 each) is the shortest possible route
+        def h(cell):  # Manhattan distance, never more than the real cost, so the route found is the cheapest
             return abs(cell[0] - goal[0]) + abs(cell[1] - goal[1])
 
-        visited = set()        # Cells already expanded (closed set)
-        prevNode = {}          # cell -> the cell before it on its cheapest known route
-        # Min-heap of (f, h, cell), starting with the start cell (g = 0, so f = h).
-        # Python compares tuples element by element, so h breaks ties in f.
-        queue = [(h((x, y)), h((x, y)), (x, y))]
-        dir = [(1,0), (-1,0), (0,1), (0,-1)]  # 4-connected moves (no diagonals)
-        g_cost = {(x, y): 0}   # cell -> cheapest known cost from the start (start = 0)
+        def turns(d1, d2):  # 90-degree turns from direction d1 to d2
+            if d1 == d2:
+                return 0
+            return 2 if d1 == (-d2[0], -d2[1]) else 1
+
+        # States are (cell, direction entered), so turns can be costed; the start direction is the robot's heading snapped to the grid
+        heading = math.radians(start[2])
+        if abs(math.cos(heading)) >= abs(math.sin(heading)):
+            start_dir = (1 if math.cos(heading) > 0 else -1, 0)
+        else:
+            start_dir = (0, 1 if math.sin(heading) > 0 else -1)
+        start_state = (start_cell, start_dir)
+
+        g_cost = {start_state: 0}   # Cheapest known cost to reach each state
+        prev_state = {}             # State each one was reached from, to rebuild the route
+        visited = set()             # States already expanded
+        queue = [(h(start_cell), h(start_cell), start_state)]  # (f, h, state), h breaks ties
 
         while queue:
-            # Expand the cell with the lowest f = g + h.
-            # On a tie in f, the cell with the lower h (closer to the goal) comes first.
-            _, _, (cx, cy) = heapq.heappop(queue)
-
-            # A cell can be pushed more than once (each time a cheaper route is found).
-            # Its first pop is the cheapest, so skip later copies.
-            if (cx, cy) in visited:
-                continue
-            visited.add((cx, cy))
+            _, _, state = heapq.heappop(queue)
+            if state in visited:
+                continue  # Stale queue entry, a cheaper one was already expanded
+            visited.add(state)
+            (cx, cy), cdir = state
 
             if (cx, cy) == goal:
-                # Goal reached: rebuild the route by following parents back to the start.
-                # Each parent is one cell back, so every cell on the route is included.
-                # The start cell has no parent, so it is left out of the path.
-                px, py = cx, cy
+                # Walk back through prev_state to the start
+                path = [state[0]]
+                while state in prev_state:
+                    state = prev_state[state]
+                    path.append(state[0])
+                return path[::-1]
 
-                while (px, py) in prevNode:
-                    plannedPath.insert(0, (px, py))   # Prepend so the path runs start -> goal
-                    px, py = prevNode[(px, py)]
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < self.rows and 0 <= ny < self.cols) or self.map_array[nx, ny] != 0:
+                    continue  # Off the map or a wall
+                # Step cost: 1 per cell, plus turns and nearness to walls
+                new_g = g_cost[state] + 1 + self.turn_penalty * turns(cdir, (dx, dy)) + self.wall_cost[nx, ny]
+                next_state = ((nx, ny), (dx, dy))
+                if new_g < g_cost.get(next_state, float('inf')):
+                    g_cost[next_state] = new_g
+                    prev_state[next_state] = state
+                    heapq.heappush(queue, (new_g + h((nx, ny)), h((nx, ny)), next_state))
 
-                return plannedPath
-            else:
-                # Try each of the 4 neighbours of the current cell
-                for dx, dy in dir:
-                    nx, ny = cx + dx, cy + dy
-
-                    # Skip neighbours outside the grid or on a wall
-                    if not (0 <= nx < self.rows and 0 <= ny < self.cols) or self.map_array[nx, ny] != 0:
-                        continue
-
-                    # Cost of reaching the neighbour by going through the current cell
-                    # (every straight move costs 1 cell, no wall penalty)
-                    new_g = g_cost[(cx, cy)] + 1
-
-                    # Keep it only if it beats the best route found so far
-                    # (unseen cells default to infinity, so their first route always wins)
-                    if new_g < g_cost.get((nx, ny), float('inf',)):
-                        g_cost[(nx, ny)] = new_g          # New best cost to the neighbour
-                        prevNode[(nx, ny)] = (cx, cy)     # Remember where it was reached from
-                        # Push (f, h, cell): f = cost so far + estimated cost remaining,
-                        # h = estimated cost remaining, used as the tie-breaker
-                        heapq.heappush(queue, (new_g + h((nx, ny)), h((nx, ny)), (nx, ny)))
-
-        # Queue empty without reaching the goal: no route exists
-        return plannedPath
+        return []
         ###### INSERT CODE HERE ######
 
 
