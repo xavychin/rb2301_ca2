@@ -179,28 +179,13 @@ class WaypointNode(Node):
         ##Variables
         # ----- Route -----
         # A goal's route is a list of straight runs (segments), each ((start_x, start_y), (end_x, end_y), heading to hold in rad).
-        # The robot turns on the spot to the run's heading, then drives it forwards (or backwards for some correction runs).
+        # The robot turns on the spot to the run's heading, then drives it forwards. The pose (x, y) itself is driven along
+        # the runs, and the last run ends exactly on the goal coordinate.
         self.goal_index = 0                         # Index in goal_list of the goal being driven to
         self.rows, self.cols = self.map_array.shape # Grid size, used for bounds checks
         self.segments = []                          # Runs to the current goal; empty means "plan the next goal"
         self.segment_index = 0                      # Run being driven
         self.turning = True                         # True: turning on the spot to face the run, False: driving along it
-
-        # ----- Robot base (robot frame: x forward, y left, metres) -----
-        # The goal has to end up under the base, so the base centre is what is driven along the runs and put on each goal.
-        # The pose is the Optitrack rigid body's pivot, which can be anywhere on the robot. The robot turns on the spot about
-        # its base centre, so the pivot -> base centre offset is measured from those turns (measure_base_offset()).
-        self.base_offset = (0.0, 0.0)               # Pivot -> base centre, starts at 0 until the first turn is measured
-        self.base_half_size = (0.106, 0.079)        # Half length and half width of the base around its centre
-        self.footprint_margin = 0.02                # m, a goal counts as under the base only this far inside its edge
-
-        # ----- Base offset measurement -----
-        self.turn_samples = []                      # Pivot (x, y, heading in rad) during the current turn on the spot
-        self.offset_fit_sum = np.zeros(2)           # Sum of measured offsets, each weighted by how far that turn went
-        self.offset_fit_weight = 0.0                # Sum of the weights, base_offset = sum / weight
-        self.min_fit_turn = np.deg2rad(40)          # Shorter turns are not used, the fit is unreliable
-        self.max_fit_residual = 0.01                # m, fits worse than this are ignored (wheel slip, tracking glitch)
-        self.max_base_offset = 0.2                  # m, larger offsets can't be on the robot and are ignored
 
         # ----- A* costs (in cells, a step costs 1) -----
         self.turn_penalty = 2.0                     # Extra cost per 90-degree turn, prefers fewer corners
@@ -244,15 +229,9 @@ class WaypointNode(Node):
         self.realign_threshold = np.deg2rad(25)     # Heading error while driving that triggers a new turn on the spot
         self.turn_timeout = 5.0                     # s, after this a turn is accepted within turn_timeout_tolerance
         self.turn_timeout_tolerance = np.deg2rad(10)
-        self.position_tolerance = 0.02              # m left in a run that counts as the end of it
-        self.goal_tolerance = 0.03                  # m, base centre this close to the goal = reached
-        self.straight_correction_tolerance = 0.01   # m, sideways miss small enough to fix by driving straight, no turn
-        self.max_goal_corrections = 5               # After this many correction runs, accept the goal if it is under the base
-        self.give_up_corrections = 10               # After this many, move on to the next goal anyway
 
         # ----- Controller state -----
-        self.goal_corrections = 0                   # Correction runs done for the current goal
-        self.heading_integral = 0.0                 # Heading PID integral
+        self.heading_integral = 0.0                # Heading PID integral
         self.prev_pose = None                       # Pivot (x, y, heading in rad) at the last tick, for the measured rates
         self.measured_turn_rate = 0.0               # rad/s, filtered
         self.measured_speed = 0.0                   # m/s forwards, filtered
@@ -358,8 +337,7 @@ class WaypointNode(Node):
 
         ###### INSERT CODE HERE ######
         # Each tick does one of three things: PLAN the route to the next goal, TURN on the spot to face the current run,
-        # or DRIVE along it. When the last run of a goal ends, finish_goal() checks the base is on the goal and adds
-        # correction runs if it isn't.
+        # or DRIVE along it. A run ends when the robot reaches its end point; the last run's end point is the goal coordinate.
 
         # Time since the last tick, clipped so a hiccup can't blow up the PID terms
         dt = 0.05 if self.last_time is None else float(np.clip(now - self.last_time, 1e-3, 0.2))
@@ -376,7 +354,6 @@ class WaypointNode(Node):
             self.measured_turn_rate += 0.5 * (rate_now - self.measured_turn_rate)
             self.measured_speed += 0.5 * (speed_now - self.measured_speed)
         self.prev_pose = (x, y, heading)
-        bx, by = self.base_centre()  # The point that is driven along the runs
 
         # ===== PLAN: no runs left -> plan to the next goal =====
         if not self.segments:
@@ -388,12 +365,13 @@ class WaypointNode(Node):
             goal_xy = self.goal_list[self.goal_index]
             goal_cell = world_to_grid(goal_xy[0], goal_xy[1], self.origin, self.resolution)
             self.segment_index = 0
-            # Already in the goal cell: no route needed, the correction runs in finish_goal() place the base
-            if world_to_grid(bx, by, self.origin, self.resolution) == goal_cell:
-                self.finish_goal()
+            # Already in the goal cell: no route needed, one run straight onto the goal coordinate
+            if world_to_grid(x, y, self.origin, self.resolution) == goal_cell:
+                self.segments = [((x, y), tuple(goal_xy), math.atan2(goal_xy[1] - y, goal_xy[0] - x))]
+                self.start_turn()
                 return
 
-            path = self.aStar((bx, by, heading_deg), goal_xy)
+            path = self.aStar((x, y, heading_deg), goal_xy)
             if not path:
                 self.get_logger().error(f"No path to goal {self.goal_index}")
                 self.move_2D(0, 0, 0)
@@ -411,11 +389,9 @@ class WaypointNode(Node):
 
         # ===== Where the robot is relative to the current run =====
         (sx, sy), (ex, ey), run_heading = self.segments[self.segment_index]
-        hx, hy = math.cos(run_heading), math.sin(run_heading)
-        direction = 1.0 if (ex - sx) * hx + (ey - sy) * hy >= 0 else -1.0  # +1 forwards, -1 in reverse
-        ux, uy = direction * hx, direction * hy     # Direction of travel
-        along = (ex - bx) * ux + (ey - by) * uy     # Distance left along the run
-        cross = ux * (by - sy) - uy * (bx - sx)     # Distance off the line (+ = left)
+        ux, uy = math.cos(run_heading), math.sin(run_heading)  # Direction of travel
+        along = (ex - x) * ux + (ey - y) * uy       # Distance left along the run
+        cross = ux * (y - sy) - uy * (x - sx)       # Distance off the line (+ = left)
         turn_error = math.remainder(run_heading - heading, 2 * math.pi)
 
         # ===== TURN on the spot to face the run =====
@@ -425,28 +401,26 @@ class WaypointNode(Node):
         if self.turning:
             timed_out = now - self.turn_start_time > self.turn_timeout
             if abs(turn_error) < self.align_tolerance or (timed_out and abs(turn_error) < self.turn_timeout_tolerance):
-                # Facing the run: switch to driving, and use this turn to measure the base offset
+                # Facing the run: switch to driving
                 self.turning = False
                 self.heading_integral = 0.0
                 self.drive_start_time = now
-                self.measure_base_offset()
             else:
                 # Turn at the PID rate, at least min_turn_speed, plus the learned deadband
                 turn_rate = max(abs(self.heading_pid(turn_error, dt)), self.min_turn_speed)
                 turn_rate = min(turn_rate, 2 * max_translate_velocity - self.turn_deadband)  # Stay under move_2D's cap
                 if now - self.turn_start_time > self.learn_delay:  # Skips the start, while the robot may still be rolling
-                    self.turn_samples.append((x, y, heading))
                     measured = math.copysign(1, turn_error) * self.measured_turn_rate
                     self.turn_deadband = self.learn_deadband(self.turn_deadband, turn_rate, measured, self.stall_turn_rate,
                                                              self.turn_deadband_rise, self.max_turn_deadband, dt)
                 self.move_2D(0, 0, math.copysign(turn_rate + self.turn_deadband, turn_error))
                 return
 
-        # ===== End of the run: next run, or check the goal =====
-        if along < self.position_tolerance:
+        # ===== End of the run (end point reached): next run, or goal reached =====
+        if along <= 0.0:
             self.segment_index += 1
             if self.segment_index >= len(self.segments):
-                self.finish_goal()
+                self.goal_done()
             else:
                 self.move_2D(0, 0, 0)
                 self.start_turn()
@@ -463,9 +437,9 @@ class WaypointNode(Node):
         target_speed *= math.cos(drive_error)                               # Slow down while off heading
         self.speed = min(target_speed, self.speed + self.max_accel * dt)    # Acceleration limit
         if now - self.drive_start_time > self.learn_delay:
-            self.drive_deadband = self.learn_deadband(self.drive_deadband, self.speed, direction * self.measured_speed, self.stall_speed,
+            self.drive_deadband = self.learn_deadband(self.drive_deadband, self.speed, self.measured_speed, self.stall_speed,
                                                       self.drive_deadband_rise, self.max_drive_deadband, dt)
-        self.move_2D(direction * (self.speed + self.drive_deadband), 0, self.heading_pid(drive_error, dt))
+        self.move_2D(self.speed + self.drive_deadband, 0, self.heading_pid(drive_error, dt))
 
     def heading_pid(self, error:float, dt:float) -> float:
         '''Heading error (rad) -> turn rate (rad/s). The D term uses the measured turn rate.'''
@@ -490,96 +464,11 @@ class WaypointNode(Node):
         self.speed = 0.0
         self.heading_integral = 0.0
         self.turn_start_time = time.time()
-        self.turn_samples = []
-
-    def base_centre(self) -> tuple:
-        '''World (x, y) of the centre of the robot's base: the Optitrack pivot moved by base_offset.'''
-        x, y, heading_deg = self.pose
-        h = math.radians(heading_deg)
-        ox, oy = self.base_offset
-        return (x + ox * math.cos(h) - oy * math.sin(h), y + ox * math.sin(h) + oy * math.cos(h))
-
-    def goal_in_base_frame(self, gx:float, gy:float) -> tuple:
-        '''Goal relative to the base centre: (ahead, left) in metres.'''
-        bx, by = self.base_centre()
-        h = math.radians(self.pose[2])
-        dx, dy = gx - bx, gy - by
-        return (dx * math.cos(h) + dy * math.sin(h), -dx * math.sin(h) + dy * math.cos(h))
-
-    def measure_base_offset(self):
-        '''After a turn on the spot, fit the point the robot turned about (its base centre) and update base_offset.
-        Every pivot sample satisfies p = c + R(heading) d, with c the fixed base centre and d the pivot's offset
-        from it in the robot frame, which is linear in (c, d), so least squares solves it.'''
-        samples, self.turn_samples = self.turn_samples, []
-        if len(samples) < 10:
-            return
-        xs, ys, hs = np.array(samples).T
-        hs = np.unwrap(hs)  # No jump at +-180 degrees
-        span = float(hs.max() - hs.min())
-        if span < self.min_fit_turn:
-            return
-        # Unknowns [cx, cy, dx, dy]; rows: x = cx + cos*dx - sin*dy and y = cy + sin*dx + cos*dy
-        n = len(xs)
-        A = np.zeros((2 * n, 4))
-        A[:n, 0], A[:n, 2], A[:n, 3] = 1.0, np.cos(hs), -np.sin(hs)
-        A[n:, 1], A[n:, 2], A[n:, 3] = 1.0, np.sin(hs), np.cos(hs)
-        b = np.concatenate((xs, ys))
-        solution = np.linalg.lstsq(A, b, rcond=None)[0]
-        residual = float(np.sqrt(np.mean((A @ solution - b) ** 2)))
-        offset = -solution[2:]  # Pivot -> base centre
-        if residual > self.max_fit_residual or np.hypot(*offset) > self.max_base_offset:
-            self.get_logger().debug(f"Base offset fit ignored: offset {offset}, residual {residual:.4f} m")
-            return
-        # Running average over all turns, longer turns count more
-        self.offset_fit_sum += span * offset
-        self.offset_fit_weight += span
-        self.base_offset = tuple(float(v) for v in self.offset_fit_sum / self.offset_fit_weight)
-        self.get_logger().info(f"Base centre is {self.base_offset[0]:+.3f} m ahead, {self.base_offset[1]:+.3f} m left "
-                               f"of the Optitrack pivot (this turn: {offset[0]:+.3f}, {offset[1]:+.3f}, residual {residual:.4f} m)")
-
-    def finish_goal(self):
-        '''Goal done once the base centre is within goal_tolerance (or, after max_goal_corrections, once the goal is
-        under the base). Otherwise add a correction run that puts the base centre on the goal.'''
-        gx, gy = self.goal_list[self.goal_index]
-        ahead, left = self.goal_in_base_frame(gx, gy)
-        miss = math.hypot(ahead, left)
-        under_base = (abs(ahead) <= self.base_half_size[0] - self.footprint_margin and
-                      abs(left) <= self.base_half_size[1] - self.footprint_margin)
-        if miss <= self.goal_tolerance:
-            self.goal_done()
-            return
-        if self.goal_corrections >= self.max_goal_corrections and under_base:
-            self.get_logger().info(f"Goal {self.goal_index} is {miss:.3f} m from the base centre but under the base, accepting")
-            self.goal_done()
-            return
-        if self.goal_corrections >= self.give_up_corrections:
-            self.get_logger().warn(f"Goal {self.goal_index} still {miss:.3f} m off after {self.goal_corrections} corrections, moving on")
-            self.goal_done()
-            return
-        self.goal_corrections += 1
-        self.get_logger().info(f"Goal {self.goal_index} is {miss:.3f} m away ({ahead:+.3f} ahead, {left:+.3f} left), "
-                               f"correction run {self.goal_corrections}")
-        self.move_2D(0, 0, 0)
-
-        # The correction run is appended; segment_index already points past the last run, so it is driven next
-        bx, by = self.base_centre()
-        heading = math.radians(self.pose[2])
-        if abs(left) <= self.straight_correction_tolerance:
-            # Nearly in line: drive straight forwards or backwards, no turn
-            end = (bx + ahead * math.cos(heading), by + ahead * math.sin(heading))
-            self.segments.append(((bx, by), end, heading))
-        else:
-            # Face the goal, or face away and reverse onto it, whichever turn is smaller
-            to_goal = math.atan2(gy - by, gx - bx)
-            new_heading = min((to_goal, to_goal + math.pi), key=lambda h: abs(math.remainder(h - heading, 2 * math.pi)))
-            self.segments.append(((bx, by), (gx, gy), new_heading))
-        self.start_turn()
 
     def goal_done(self):
         '''Stop and move on to the next goal (empty segments make the next tick plan it).'''
         self.move_2D(0, 0, 0)
         self.get_logger().info(f"Reached goal {self.goal_index}: {self.goal_list[self.goal_index]}")
-        self.goal_corrections = 0
         self.goal_index += 1
         self.segments = []
         self.path = []
