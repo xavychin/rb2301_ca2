@@ -178,14 +178,14 @@ class WaypointNode(Node):
 
         ##Variables
         # ----- Route -----
-        # A goal's route is a list of straight runs (segments), each ((start_x, start_y), (end_x, end_y), heading to hold in rad).
-        # The robot turns on the spot to the run's heading, then drives it forwards. The pose (x, y) itself is driven along
-        # the runs, and the last run ends exactly on the goal coordinate.
+        # A goal's route is a list of straight runs (segments), each ((start_x, start_y), (end_x, end_y), heading of the run in rad).
+        # Pure pursuit: the robot aims at the point where a circle of radius lookahead around it cuts the route, and drives
+        # an arc through it, so corners are taken as curves while moving. The last run ends exactly on the goal coordinate.
         self.goal_index = 0                         # Index in goal_list of the goal being driven to
         self.rows, self.cols = self.map_array.shape # Grid size, used for bounds checks
         self.segments = []                          # Runs to the current goal; empty means "plan the next goal"
-        self.segment_index = 0                      # Run being driven
-        self.turning = True                         # True: turning on the spot to face the run, False: driving along it
+        self.segment_index = 0                      # Run the aim point is on
+        self.turning = True                         # True: spinning on the spot to face the aim point, False: driving arcs
 
         # ----- A* costs (in cells, a step costs 1) -----
         self.turn_penalty = 2.0                     # Extra cost per 90-degree turn, prefers fewer corners
@@ -206,10 +206,28 @@ class WaypointNode(Node):
         self.min_drive_speed = 0.05                 # m/s, floor so the robot doesn't creep at the end of a run
         self.max_accel = 1.0                        # m/s^2, ramps the speed up after each turn
 
-        # ----- Cross-track correction: steer back onto the run's centre line -----
-        self.k_cross_track = 4.0                    # rad of heading change per metre off the line
-        self.max_cross_track_correction = np.deg2rad(8)
-        self.cross_track_fade_distance = 0.2        # m, fades out over this distance before a corner
+        # ----- Pure pursuit: turn while moving -----
+        self.lookahead = 0.3                        # m, radius of the aim circle. Bigger = smoother arcs but cuts corners more (~0.3 x lookahead)
+        self.corner_speed = 0.15                    # m/s, speed going into a corner (the arc starts when the corner enters the aim circle)
+        self.k_curve = 0.5                          # Slows down on tight arcs: speed / (1 + k_curve * |curvature|)
+        self.track_offset = 0.07                    # m, steer by the point this far ahead of the reported pose (the rear axle), i.e. the
+                                                    # middle of the body, so the nose doesn't swing wide on arcs. 0 = steer by the pose itself
+
+        # ----- Body size around the reported pose (sim: the rear axle), used to pick a spin direction that keeps the body off walls -----
+        self.body_front = 0.18                      # m ahead of the pose
+        self.body_rear = 0.03                       # m behind the pose
+        self.body_half_width = 0.10                 # m to each side
+        self.body_margin = 0.01                     # m, a corner only counts as in a wall once it is this far inside the wall cell
+        self.spin_dir = 0                           # +1 left / -1 right for the spin in progress, 0 = not chosen yet
+        self.max_spin_speed = 0.5                   # rad/s, slower than max_turn_speed so spins on the spot don't overshoot or slide
+
+        # ----- Reposition before a spin: shuffle straight forwards/backwards to where the spin sweeps the fewest wall cells -----
+        self.max_reposition = 0.2                   # m, furthest it will move along its heading before spinning
+        self.reposition_step = 0.02                 # m, spacing of the positions tried
+        self.reposition_speed = 0.1                 # m/s, top speed while repositioning
+        self.reposition_tolerance = 0.01            # m, close enough to the spin spot
+        self.reposition_goal = None                 # (x, y) of the pose to spin from, None = spin where it stands
+        self.reposition_start_time = 0.0            # When the shuffle started, it gives up after a timeout (e.g. stuck on a wall)
 
         # ----- Deadband compensation: offsets added to commands, learned while driving, to overcome friction -----
         self.turn_deadband = 0.0                    # rad/s, current learned value
@@ -225,10 +243,9 @@ class WaypointNode(Node):
         self.learn_delay = 0.3                      # s after a turn or drive starts before learning (and turn sampling) begins
 
         # ----- Tolerances -----
-        self.align_tolerance = np.deg2rad(3)        # Turn on the spot is done within this
-        self.realign_threshold = np.deg2rad(25)     # Heading error while driving that triggers a new turn on the spot
-        self.turn_timeout = 5.0                     # s, after this a turn is accepted within turn_timeout_tolerance
-        self.turn_timeout_tolerance = np.deg2rad(10)
+        self.align_tolerance = np.deg2rad(15)       # Spin on the spot is done within this, pure pursuit takes over
+        self.realign_threshold = np.deg2rad(90)     # Aim point further off than this (beside/behind) -> spin on the spot instead
+        self.goal_tolerance = 0.05                  # m, goal counts as reached within this (or once driven past on the last run)
 
         # ----- Controller state -----
         self.heading_integral = 0.0                # Heading PID integral
@@ -336,8 +353,8 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
-        # Each tick does one of three things: PLAN the route to the next goal, TURN on the spot to face the current run,
-        # or DRIVE along it. A run ends when the robot reaches its end point; the last run's end point is the goal coordinate.
+        # Each tick does one of three things: PLAN the route to the next goal, SPIN on the spot to face the aim point
+        # (start of a goal, or aim point behind the robot), or DRIVE an arc through the aim point (pure pursuit).
 
         # Time since the last tick, clipped so a hiccup can't blow up the PID terms
         dt = 0.05 if self.last_time is None else float(np.clip(now - self.last_time, 1e-3, 0.2))
@@ -387,59 +404,99 @@ class WaypointNode(Node):
             self.start_turn()
             return
 
-        # ===== Where the robot is relative to the current run =====
-        (sx, sy), (ex, ey), run_heading = self.segments[self.segment_index]
-        ux, uy = math.cos(run_heading), math.sin(run_heading)  # Direction of travel
-        along = (ex - x) * ux + (ey - y) * uy       # Distance left along the run
-        cross = ux * (y - sy) - uy * (x - sx)       # Distance off the line (+ = left)
-        turn_error = math.remainder(run_heading - heading, 2 * math.pi)
+        # ===== Steer by the middle of the body, except on the final approach (the goal is reached by the pose itself) =====
+        gx, gy = self.segments[-1][1]
+        if self.segment_index < len(self.segments) - 1 or math.hypot(gx - x, gy - y) > self.lookahead:
+            x, y = x + self.track_offset * math.cos(heading), y + self.track_offset * math.sin(heading)
 
-        # ===== TURN on the spot to face the run =====
-        if not self.turning and abs(turn_error) > self.realign_threshold:
-            self.start_turn()  # Knocked off course while driving
+        # ===== Move on to the next run once its end (the corner) is inside the aim circle =====
+        # The aim point then lies on the next run, so the robot starts curving before the corner
+        while self.segment_index < len(self.segments) - 1:
+            _, (ex, ey), _ = self.segments[self.segment_index]
+            if math.hypot(ex - x, ey - y) >= self.lookahead:
+                break
+            self.segment_index += 1
+
+        # ===== Where the robot is relative to the run =====
+        (sx, sy), (ex, ey), run_heading = self.segments[self.segment_index]
+        last_run = self.segment_index == len(self.segments) - 1
+        ux, uy = math.cos(run_heading), math.sin(run_heading)  # Direction of travel
+        run_length = math.hypot(ex - sx, ey - sy)
+        progress = (x - sx) * ux + (y - sy) * uy    # Distance travelled along the run
+        cross = ux * (y - sy) - uy * (x - sx)       # Distance off the line (+ = left)
+        to_end = math.hypot(ex - x, ey - y)
+
+        # ===== Goal reached: close to it, or driven past it on the last run =====
+        if last_run and (to_end < self.goal_tolerance or progress >= run_length):
+            self.goal_done()
+            return
+
+        # ===== Aim point: where the aim circle cuts the run, ahead of the robot =====
+        if abs(cross) < self.lookahead:
+            t_aim = progress + math.sqrt(self.lookahead ** 2 - cross ** 2)
+        else:
+            t_aim = progress  # Further off the line than the lookahead: head for the nearest point on it
+        t_aim = float(np.clip(t_aim, 0.0, run_length))
+        ax, ay = sx + ux * t_aim, sy + uy * t_aim
+        aim_dist = max(math.hypot(ax - x, ay - y), 1e-3)
+        alpha = math.remainder(math.atan2(ay - y, ax - x) - heading, 2 * math.pi)  # Aim point's angle from the heading (+ = left)
+
+        # ===== SPIN on the spot when the aim point is beside or behind the robot =====
+        if not self.turning and abs(alpha) > self.realign_threshold:
+            self.start_turn()
 
         if self.turning:
-            timed_out = now - self.turn_start_time > self.turn_timeout
-            if abs(turn_error) < self.align_tolerance or (timed_out and abs(turn_error) < self.turn_timeout_tolerance):
-                # Facing the run: switch to driving
+            if abs(alpha) < self.align_tolerance:
+                # Roughly facing the aim point: pure pursuit takes over
                 self.turning = False
+                self.spin_dir = 0
                 self.heading_integral = 0.0
                 self.drive_start_time = now
             else:
+                # Plan the spin once: where to spin from (a straight shuffle along the heading) and which way to turn
+                if self.spin_dir == 0:
+                    self.plan_spin(heading, alpha)
+
+                # Shuffle straight to the spin spot first
+                if self.reposition_goal is not None:
+                    tx, ty = self.reposition_goal
+                    to_go = (tx - self.pose[0]) * math.cos(heading) + (ty - self.pose[1]) * math.sin(heading)  # + = ahead
+                    stuck = now - self.reposition_start_time > self.max_reposition / self.reposition_speed + 2.0
+                    if abs(to_go) > self.reposition_tolerance and not stuck:
+                        speed = min(self.reposition_speed, self.kp_drive * abs(to_go)) + self.drive_deadband
+                        self.move_2D(math.copysign(speed, to_go), 0, 0)
+                        return
+                    self.reposition_goal = None
+                    self.turn_start_time = now  # The turn itself starts now (for deadband learning)
+
+                if math.copysign(1, alpha) != self.spin_dir:
+                    alpha += self.spin_dir * 2 * math.pi  # Keep turning the chosen way (the long way round)
                 # Turn at the PID rate, at least min_turn_speed, plus the learned deadband
-                turn_rate = max(abs(self.heading_pid(turn_error, dt)), self.min_turn_speed)
+                turn_rate = min(max(abs(self.heading_pid(alpha, dt)), self.min_turn_speed), self.max_spin_speed)
                 turn_rate = min(turn_rate, 2 * max_translate_velocity - self.turn_deadband)  # Stay under move_2D's cap
                 if now - self.turn_start_time > self.learn_delay:  # Skips the start, while the robot may still be rolling
-                    measured = math.copysign(1, turn_error) * self.measured_turn_rate
+                    measured = math.copysign(1, alpha) * self.measured_turn_rate
                     self.turn_deadband = self.learn_deadband(self.turn_deadband, turn_rate, measured, self.stall_turn_rate,
                                                              self.turn_deadband_rise, self.max_turn_deadband, dt)
-                self.move_2D(0, 0, math.copysign(turn_rate + self.turn_deadband, turn_error))
+                self.move_2D(0, 0, math.copysign(turn_rate + self.turn_deadband, alpha))
                 return
 
-        # ===== End of the run (end point reached): next run, or goal reached =====
-        if along <= 0.0:
-            self.segment_index += 1
-            if self.segment_index >= len(self.segments):
-                self.goal_done()
-            else:
-                self.move_2D(0, 0, 0)
-                self.start_turn()
-            return
+        # ===== DRIVE an arc through the aim point (pure pursuit) =====
+        curvature = 2 * math.sin(alpha) / aim_dist  # 1 / turning radius (+ = left)
 
-        # ===== DRIVE along the run =====
-        # Steer back onto the line. Fades out before corners (the next turn fixes it), stays on for the last run
-        last_run = self.segment_index == len(self.segments) - 1
-        fade = 1.0 if last_run else float(np.clip(along / self.cross_track_fade_distance, 0.0, 1.0))
-        correction = fade * float(np.clip(-self.k_cross_track * cross, -self.max_cross_track_correction, self.max_cross_track_correction))
-        drive_error = math.remainder(run_heading + correction - heading, 2 * math.pi)
-
-        target_speed = float(np.clip(self.kp_drive * along, self.min_drive_speed, max_translate_velocity))
-        target_speed *= math.cos(drive_error)                               # Slow down while off heading
-        self.speed = min(target_speed, self.speed + self.max_accel * dt)    # Acceleration limit
+        # Slow down for the goal, or to corner_speed by the time the next corner enters the aim circle
+        if last_run:
+            target_speed = float(np.clip(self.kp_drive * to_end, self.min_drive_speed, max_translate_velocity))
+        else:
+            target_speed = float(np.clip(self.corner_speed + self.kp_drive * (to_end - self.lookahead),
+                                         self.corner_speed, max_translate_velocity))
+        target_speed /= 1 + self.k_curve * abs(curvature)                                   # Slower on tight arcs
+        target_speed = min(target_speed, self.max_turn_speed / max(abs(curvature), 1e-6))   # Keeps speed * curvature under the turn cap
+        self.speed = min(target_speed, self.speed + self.max_accel * dt)                    # Acceleration limit
         if now - self.drive_start_time > self.learn_delay:
             self.drive_deadband = self.learn_deadband(self.drive_deadband, self.speed, self.measured_speed, self.stall_speed,
                                                       self.drive_deadband_rise, self.max_drive_deadband, dt)
-        self.move_2D(self.speed + self.drive_deadband, 0, self.heading_pid(drive_error, dt))
+        self.move_2D(self.speed + self.drive_deadband, 0, self.speed * curvature)
 
     def heading_pid(self, error:float, dt:float) -> float:
         '''Heading error (rad) -> turn rate (rad/s). The D term uses the measured turn rate.'''
@@ -458,9 +515,49 @@ class WaypointNode(Node):
             deadband -= self.deadband_fall * deadband * dt
         return float(np.clip(deadband, 0.0, limit))
 
+    def plan_spin(self, heading:float, alpha:float):
+        '''Choose the spin spot (up to max_reposition along the heading) and direction whose sweep hits the fewest wall cells.
+        Ties go to the smallest move, then the shorter way round. Sets reposition_goal and spin_dir.'''
+        x, y = self.pose[0], self.pose[1]
+        c, s = math.cos(heading), math.sin(heading)
+        short = math.copysign(1, alpha)
+        n = int(round(self.max_reposition / self.reposition_step))
+        best = None
+        for k in sorted(range(-n, n + 1), key=abs):  # Smallest moves first
+            shift = k * self.reposition_step
+            # The straight shuffle there must not drive the body into a wall either
+            path_hits = sum(self.spin_wall_hits(x + c * d, y + s * d, heading, 0.0)
+                            for d in np.linspace(0.0, shift, abs(k) + 1)[1:])
+            for direction, turn in ((short, alpha), (-short, alpha - short * 2 * math.pi)):
+                hits = path_hits + self.spin_wall_hits(x + c * shift, y + s * shift, heading, turn)
+                if best is None or hits < best[0]:
+                    best = (hits, shift, direction)
+        _, shift, self.spin_dir = best
+        self.reposition_goal = (x + c * shift, y + s * shift) if shift != 0 else None
+        self.reposition_start_time = time.time()
+        if shift != 0:
+            self.get_logger().info(f"Repositioning {shift:+.2f} m before spinning {'left' if self.spin_dir > 0 else 'right'}")
+
+    def spin_wall_hits(self, x:float, y:float, heading:float, turn:float) -> int:
+        '''Wall cells the body outline passes through while spinning on the spot by turn (rad) from heading (turn = 0: standing still).'''
+        # Outline pulled in by body_margin, so a corner sitting exactly on a cell edge doesn't count as a hit
+        f, r, w = self.body_front - self.body_margin, self.body_rear - self.body_margin, self.body_half_width - self.body_margin
+        mid = (f - r) / 2
+        corners = [(f, w), (f, 0.0), (f, -w), (mid, w), (mid, -w), (-r, w), (-r, -w)]
+        hits = 0
+        for k in range(int(abs(turn) / np.deg2rad(10)) + 1):  # Every 10 degrees
+            a = heading + math.copysign(k * np.deg2rad(10), turn)
+            c, s = math.cos(a), math.sin(a)
+            for bx, by in corners:
+                i, j = world_to_grid(x + c * bx - s * by, y + s * bx + c * by, self.origin, self.resolution)
+                hits += not (0 <= i < self.rows and 0 <= j < self.cols) or self.map_array[i, j] != 0
+        return hits
+
     def start_turn(self):
         '''Switch to turning on the spot (speed and PID integral start again from zero).'''
         self.turning = True
+        self.spin_dir = 0
+        self.reposition_goal = None
         self.speed = 0.0
         self.heading_integral = 0.0
         self.turn_start_time = time.time()
